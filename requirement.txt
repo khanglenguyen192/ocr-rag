@@ -1,0 +1,22 @@
+# Core conversion
+pymupdf4llm
+
+# LightOnOCR-2-1B dependencies
+# Yêu cầu transformers >= 5.0.0 (hỗ trợ LightOnOcrForConditionalGeneration)
+transformers>=5.0.0
+torch
+torchvision
+pillow
+pypdfium2
+accelerate
+
+# Multiple OCR methods dependencies
+pytesseract
+easyocr
+pdf2image
+PyMuPDF
+opencv-python-headless
+
+# vLLM (tuỳ chọn - phục vụ model qua API, yêu cầu GPU CUDA)
+# vllm
+
