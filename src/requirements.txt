@@ -13,6 +13,11 @@ transformers>=5.0.0
 Pillow>=10.3.0
 pypdfium2>=4.30.0
 
+# Optional OCR engines (loaded lazily on first use)
+easyocr>=1.7.1                 # EasyOCR — pip install easyocr
+paddlepaddle>=3.0.0            # PaddleOCR backend — pip install paddlepaddle
+paddleocr>=3.0.0               # PaddleOCR v3 — pip install paddleocr
+
 # ── PDF (digital) to Markdown ─────────────────────────────────────────────────
 pymupdf4llm>=0.0.17
 pymupdf>=1.24.0
@@ -28,13 +33,3 @@ pytest>=8.2.0
 pytest-asyncio>=0.23.0
 httpx>=0.27.0
 
-# ── Database (PostgreSQL) ─────────────────────────────────────────────────────
-sqlalchemy[asyncio]>=2.0.30
-asyncpg>=0.29.0                # PostgreSQL async driver
-aiosqlite>=0.20.0              # SQLite async driver (used in tests only)
-alembic>=1.13.0
-
-# ── Not used in MVP (kept for future reference) ───────────────────────────────
-# aiosqlite>=0.20.0            # SQLite async driver (dev only)
-# celery[redis]>=5.4.0
-# redis>=5.0.0

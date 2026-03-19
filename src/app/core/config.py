@@ -9,8 +9,6 @@ class Settings(BaseSettings):
     APP_VERSION: str = "1.0.0"
     DEBUG: bool = False
 
-    # Database (PostgreSQL)
-    DATABASE_URL: str = "postgresql+asyncpg://postgres:postgres@localhost:5432/pgocr"
 
     # Model (LightOnOCR-2-1B)
     MODEL_DIR: str = "LightOnOCR-2-1B"

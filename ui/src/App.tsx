@@ -1,6 +1,7 @@
-import { useState, useMemo } from 'react';
+import { useState, useMemo, useEffect, useRef } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkBreaks from 'remark-breaks';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeRaw from 'rehype-raw';
 import rehypeSanitize, { defaultSchema } from 'rehype-sanitize';
@@ -22,6 +23,102 @@ function App() {
   const [viewMode, setViewMode] = useState<'preview' | 'raw'>('preview');
   const [streamProgress, setStreamProgress] = useState<{ page: number; total: number } | null>(null);
 
+  // YouTube verify state
+  type YoutubeLanguage = { language: string; language_code: string; is_generated: boolean };
+  type YoutubeStep = 'input' | 'select-language' | 'done';
+  const [youtubeStep, setYoutubeStep] = useState<YoutubeStep>('input');
+  const [youtubeLanguages, setYoutubeLanguages] = useState<YoutubeLanguage[]>([]);
+  const [selectedLanguage, setSelectedLanguage] = useState<string>('');
+  const [verifying, setVerifying] = useState(false);
+
+  // OCR engine selection (for pdf-scan and image modes)
+  type OcrEngine = 'lighton' | 'easyocr' | 'paddleocr';
+  const [ocrEngine, setOcrEngine] = useState<OcrEngine>('lighton');
+
+  // Timing
+  type TimingResult = { totalMs: number; label: string };
+  const [elapsed, setElapsed] = useState<number>(0);          // realtime counter (ms)
+  const [timing, setTiming] = useState<TimingResult | null>(null); // final result
+  const timerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const startTimeRef = useRef<number>(0);
+
+  const startTimer = () => {
+    setElapsed(0);
+    setTiming(null);
+    startTimeRef.current = performance.now();
+    timerRef.current = setInterval(() => {
+      setElapsed(Math.round(performance.now() - startTimeRef.current));
+    }, 100);
+  };
+
+  const stopTimer = (label: string) => {
+    if (timerRef.current) clearInterval(timerRef.current);
+    timerRef.current = null;
+    const totalMs = Math.round(performance.now() - startTimeRef.current);
+    setElapsed(0);
+    setTiming({ totalMs, label });
+  };
+
+  // Cleanup timer on unmount
+  useEffect(() => () => { if (timerRef.current) clearInterval(timerRef.current); }, []);
+
+  // File preview state
+  const [imagePreviewUrl, setImagePreviewUrl] = useState<string | null>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+
+  const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const f = e.target.files?.[0] || null;
+    setFile(f);
+    // Tạo preview URL cho ảnh
+    if (imagePreviewUrl) URL.revokeObjectURL(imagePreviewUrl);
+    if (f && f.type.startsWith('image/')) {
+      setImagePreviewUrl(URL.createObjectURL(f));
+    } else {
+      setImagePreviewUrl(null);
+    }
+  };
+
+  const handleDeleteFile = (e: React.MouseEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setFile(null);
+    if (imagePreviewUrl) { URL.revokeObjectURL(imagePreviewUrl); setImagePreviewUrl(null); }
+    // Reset input value để có thể chọn lại cùng file
+    if (fileInputRef.current) fileInputRef.current.value = '';
+  };
+
+  // Cleanup preview URL on unmount
+  useEffect(() => () => { if (imagePreviewUrl) URL.revokeObjectURL(imagePreviewUrl); }, []);
+  const [leftWidth, setLeftWidth] = useState<number>(50); // percent
+  const isDragging = useRef(false);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const abortControllerRef = useRef<AbortController | null>(null);
+
+  const onDividerMouseDown = (e: React.MouseEvent) => {
+    e.preventDefault();
+    isDragging.current = true;
+    document.body.style.cursor = 'col-resize';
+    document.body.style.userSelect = 'none';
+
+    const onMouseMove = (ev: MouseEvent) => {
+      if (!isDragging.current || !containerRef.current) return;
+      const rect = containerRef.current.getBoundingClientRect();
+      const newLeft = ((ev.clientX - rect.left) / rect.width) * 100;
+      setLeftWidth(Math.min(Math.max(newLeft, 20), 80)); // clamp 20%–80%
+    };
+
+    const onMouseUp = () => {
+      isDragging.current = false;
+      document.body.style.cursor = '';
+      document.body.style.userSelect = '';
+      window.removeEventListener('mousemove', onMouseMove);
+      window.removeEventListener('mouseup', onMouseUp);
+    };
+
+    window.addEventListener('mousemove', onMouseMove);
+    window.addEventListener('mouseup', onMouseUp);
+  };
+
   // Detect if content is HTML or Markdown
   const contentType = useMemo<'html' | 'markdown'>(() => {
     if (!result) return 'markdown';
@@ -33,7 +130,7 @@ function App() {
   }, [result]);
 
   // Xử lý SSE stream (scanned PDF — trả về từng trang)
-  const processSSEStream = async (response: Response) => {
+  const processSSEStream = async (response: Response, signal?: AbortSignal) => {
     setResult('');
     setStreamProgress(null);
 
@@ -43,6 +140,10 @@ function App() {
 
     let buffer = '';
     const pageTexts: string[] = [];
+    const pageTimes: number[] = [];
+
+    // Khi abort: cancel reader
+    signal?.addEventListener('abort', () => { reader.cancel(); });
 
     try {
       while (true) {
@@ -51,33 +152,28 @@ function App() {
 
         buffer += decoder.decode(value, { stream: true });
 
-        // SSE events are separated by "\n\n"
         const parts = buffer.split('\n\n');
-        buffer = parts.pop() ?? ''; // keep incomplete last chunk
+        buffer = parts.pop() ?? '';
 
         for (const part of parts) {
           const line = part.trim();
           if (!line.startsWith('data: ')) continue;
 
           try {
-            const payload = JSON.parse(line.slice(6)); // strip "data: "
+            const payload = JSON.parse(line.slice(6));
 
             if (payload.type === 'start') {
               setStreamProgress({ page: 0, total: payload.total });
-
             } else if (payload.type === 'page') {
               pageTexts.push(payload.text);
+              if (payload.page_elapsed_ms) pageTimes.push(payload.page_elapsed_ms);
               setStreamProgress({ page: payload.page, total: payload.total });
-
-              // Build merged markdown live: pages separated by HR + comment
               const merged = pageTexts
                 .map((t, i) => `<!-- Trang ${i + 1} -->\n\n${t.trim()}`)
                 .join('\n\n---\n\n');
               setResult(merged);
-
             } else if (payload.type === 'done') {
               setStreamProgress(null);
-
             } else if (payload.type === 'error') {
               setError(`Lỗi OCR: ${payload.message}`);
             }
@@ -86,9 +182,11 @@ function App() {
           }
         }
       }
-    } catch (err) {
-      console.error('SSE stream reading error:', err);
-      setError('Lỗi khi đọc dữ liệu từ server.');
+    } catch (err: any) {
+      if (err.name !== 'AbortError') {
+        console.error('SSE stream reading error:', err);
+        setError('Lỗi khi đọc dữ liệu từ server.');
+      }
     } finally {
       setStreamProgress(null);
     }
@@ -134,18 +232,28 @@ function App() {
     e.preventDefault();
     if (!file) return;
 
+    // Tạo AbortController mới cho mỗi request
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
+
     setLoading(true);
     setError('');
     setResult('');
     setJobId(null);
     setStreamProgress(null);
+    startTimer();
+
+    const labelMap = {
+      'pdf-digital': 'PDF Digital (pymupdf4llm)',
+      'pdf-scan':    `PDF Scan (${ocrEngine})`,
+      'image':       `Image OCR (${ocrEngine})`,
+    };
 
     const formData = new FormData();
-    // Chọn endpoint dựa theo uploadMode
     const endpointMap = {
       'pdf-digital': `${API_URL}/api/v1/pdf/digital`,
-      'pdf-scan':    `${API_URL}/api/v1/pdf/scanned`,
-      'image':       `${API_URL}/api/v1/ocr/image`,
+      'pdf-scan':    `${API_URL}/api/v1/pdf/scanned?engine=${ocrEngine}`,
+      'image':       `${API_URL}/api/v1/ocr/image?engine=${ocrEngine}`,
     };
     const endpoint = endpointMap[uploadMode];
 
@@ -155,6 +263,7 @@ function App() {
       const response = await fetch(endpoint, {
         method: 'POST',
         body: formData,
+        signal: controller.signal,
       });
 
       if (!response.ok) {
@@ -162,44 +271,93 @@ function App() {
         throw new Error(`Upload failed: ${response.statusText} - ${errorText}`);
       }
 
-      // Scanned PDF → SSE stream (page-by-page)
       if (uploadMode === 'pdf-scan') {
-        await processSSEStream(response);
+        await processSSEStream(response, controller.signal);
       } else {
         await processStream(response);
       }
 
     } catch (err: any) {
-      setError(err.message || 'Có lỗi xảy ra khi xử lý file');
+      if (err.name === 'AbortError') {
+        setError('');  // Huỷ bình thường, không hiện lỗi
+      } else {
+        setError(err.message || 'Có lỗi xảy ra khi xử lý file');
+      }
     } finally {
+      abortControllerRef.current = null;
+      stopTimer(labelMap[uploadMode]);
       setLoading(false);
     }
   };
 
-  const handleYoutube = async (e: React.FormEvent) => {
+  const handleCancelUpload = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+    }
+  };
+
+  const handleYoutubeVerify = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!youtubeUrl) return;
 
-    setLoading(true);
+    setVerifying(true);
     setError('');
-    setResult('');
+    setYoutubeLanguages([]);
+    setSelectedLanguage('');
+    setYoutubeStep('input');
+    startTimer();
 
     try {
-      const response = await fetch(`${API_URL}/api/v1/youtube/transcript`, {
+      const response = await fetch(`${API_URL}/api/v1/youtube/verify`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ url: youtubeUrl }),
       });
 
       if (!response.ok) {
-        const errorText = await response.text();
-        throw new Error(`Failed to get transcript: ${response.statusText} - ${errorText}`);
+        const err = await response.json().catch(() => ({ detail: response.statusText }));
+        throw new Error(err.detail || 'Không thể xác minh URL.');
       }
-      await processStream(response);
 
+      const data = await response.json();
+      const langs: YoutubeLanguage[] = data.available_languages ?? [];
+      setYoutubeLanguages(langs);
+      setSelectedLanguage(langs[0]?.language_code ?? '');
+      setYoutubeStep('select-language');
     } catch (err: any) {
       setError(err.message);
     } finally {
+      stopTimer('YouTube Verify');
+      setVerifying(false);
+    }
+  };
+
+  const handleYoutubeTranscript = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!youtubeUrl || !selectedLanguage) return;
+
+    setLoading(true);
+    setError('');
+    setResult('');
+    startTimer();
+
+    try {
+      const response = await fetch(`${API_URL}/api/v1/youtube/transcript`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ url: youtubeUrl, language_code: selectedLanguage }),
+      });
+
+      if (!response.ok) {
+        const err = await response.json().catch(() => ({ detail: response.statusText }));
+        throw new Error(err.detail || 'Không thể lấy transcript.');
+      }
+      await processStream(response);
+      setYoutubeStep('done'); // giữ nguyên list ngôn ngữ, chỉ reset khi bấm Huỷ
+    } catch (err: any) {
+      setError(err.message);
+    } finally {
+      stopTimer(`YouTube Transcript (${selectedLanguage})`);
       setLoading(false);
     }
   };
@@ -218,10 +376,15 @@ function App() {
 
   return (
     <div className="min-h-screen bg-gray-50 p-8 font-sans text-gray-800">
-      <div className="max-w-6xl mx-auto grid grid-cols-1 lg:grid-cols-2 gap-8 h-[90vh]">
-
+      <div
+        ref={containerRef}
+        className="max-w-[1600px] mx-auto flex gap-0 h-[90vh]"
+      >
         {/* LEFT COLUMN: Controls */}
-        <div className="flex flex-col gap-6">
+        <div
+          className="flex flex-col gap-6 overflow-y-auto pr-4 shrink-0"
+          style={{ width: `${leftWidth}%` }}
+        >
           <header className="mb-4">
             <h1 className="text-3xl font-bold text-gray-900 flex items-center gap-2">
               <FileText className="w-8 h-8 text-blue-600" />
@@ -304,66 +467,248 @@ function App() {
                 {/* Mode description badge */}
                 <p className="text-xs text-gray-400 text-center -mt-1">
                   {uploadMode === 'pdf-digital' && '⚡ Dùng pymupdf4llm – nhanh, phù hợp PDF có text layer'}
-                  {uploadMode === 'pdf-scan' && '🤖 Dùng AI 1B – phù hợp PDF scan không có text layer'}
-                  {uploadMode === 'image' && '🤖 Dùng AI 1B – nhận diện văn bản từ ảnh'}
+                  {uploadMode === 'pdf-scan' && '🤖 OCR AI – phù hợp PDF scan không có text layer'}
+                  {uploadMode === 'image' && '🤖 OCR AI – nhận diện văn bản từ ảnh'}
                 </p>
 
-                <div className="border-2 border-dashed border-gray-300 rounded-lg p-8 text-center hover:bg-gray-50 transition-colors cursor-pointer relative">
+                {/* OCR Engine Selector — chỉ hiện cho pdf-scan và image */}
+                {(uploadMode === 'pdf-scan' || uploadMode === 'image') && (
+                  <div className="bg-gray-50 rounded-lg p-3 space-y-2">
+                    <p className="text-xs font-semibold text-gray-600 uppercase tracking-wide">OCR Engine</p>
+                    <div className="grid grid-cols-3 gap-2">
+                      {([
+                        { value: 'lighton',   label: 'LightOn OCR', desc: 'AI 2-1B, tốt nhất' },
+                        { value: 'easyocr',   label: 'EasyOCR',     desc: 'Nhanh, đa ngôn ngữ' },
+                        { value: 'paddleocr', label: 'PaddleOCR',   desc: 'Baidu, chính xác cao' },
+                      ] as { value: OcrEngine; label: string; desc: string }[]).map((eng) => (
+                        <button
+                          key={eng.value}
+                          type="button"
+                          onClick={() => setOcrEngine(eng.value)}
+                          className={`flex flex-col items-center gap-0.5 p-2.5 rounded-lg border-2 text-xs font-medium transition-all ${
+                            ocrEngine === eng.value
+                              ? 'border-blue-600 bg-blue-50 text-blue-700'
+                              : 'border-gray-200 text-gray-500 hover:border-gray-300 hover:bg-white'
+                          }`}
+                        >
+                          <span className="font-semibold">{eng.label}</span>
+                          <span className={`text-[10px] ${ocrEngine === eng.value ? 'text-blue-500' : 'text-gray-400'}`}>{eng.desc}</span>
+                        </button>
+                      ))}
+                    </div>
+                  </div>
+                )}
+
+                {/* File drop zone */}
+                <div className="relative">
+                  {/* Drop zone — click mở file dialog */}
+                  <div
+                    onClick={() => !loading && fileInputRef.current?.click()}
+                    className={`border-2 border-dashed rounded-lg p-6 text-center transition-colors relative
+                      ${loading ? 'cursor-not-allowed opacity-60' : 'cursor-pointer hover:bg-gray-50'}
+                      ${file ? 'border-blue-300 bg-blue-50/30' : 'border-gray-300'}
+                    `}
+                  >
                     <input
-                        type="file"
-                        className="absolute inset-0 w-full h-full opacity-0 cursor-pointer"
-                        onChange={(e) => setFile(e.target.files?.[0] || null)}
-                        accept={uploadMode === 'image' ? 'image/*' : 'application/pdf'}
+                      ref={fileInputRef}
+                      type="file"
+                      className="hidden"
+                      onChange={handleFileChange}
+                      accept={uploadMode === 'image' ? 'image/*' : 'application/pdf'}
+                      disabled={loading}
                     />
-                    <div className="flex flex-col items-center justify-center gap-2 text-gray-500">
+
+                    {file ? (
+                      <div className="space-y-2">
+                        {/* Image preview thumbnail */}
+                        {uploadMode === 'image' && imagePreviewUrl ? (
+                          <div className="group relative inline-block">
+                            <img
+                              src={imagePreviewUrl}
+                              alt="preview"
+                              className="max-h-32 max-w-full mx-auto rounded-md object-contain shadow-sm"
+                            />
+                            {/* Hover full preview */}
+                            <div className="hidden group-hover:flex absolute z-50 bottom-full left-1/2 -translate-x-1/2 mb-2 p-2 bg-white rounded-xl shadow-2xl border border-gray-200 pointer-events-none">
+                              <img
+                                src={imagePreviewUrl}
+                                alt="full preview"
+                                className="max-h-64 max-w-xs rounded-lg object-contain"
+                              />
+                            </div>
+                          </div>
+                        ) : (
+                          /* PDF icon */
+                          <div className="group relative inline-block">
+                            <div className="w-14 h-16 mx-auto bg-red-50 border-2 border-red-200 rounded-lg flex flex-col items-center justify-center gap-1 shadow-sm">
+                              <FileInput className="w-6 h-6 text-red-400" />
+                              <span className="text-[10px] font-bold text-red-400 uppercase">PDF</span>
+                            </div>
+                            {/* Hover PDF tooltip */}
+                            <div className="hidden group-hover:flex absolute z-50 bottom-full left-1/2 -translate-x-1/2 mb-2 px-3 py-2 bg-gray-900 text-white text-xs rounded-lg shadow-xl pointer-events-none whitespace-nowrap flex-col gap-1">
+                              <span className="font-semibold">{file.name}</span>
+                              <span className="text-gray-300">{(file.size / 1024).toFixed(1)} KB</span>
+                            </div>
+                          </div>
+                        )}
+
+                        {/* Filename + delete */}
+                        <div className="flex items-center justify-center gap-2">
+                          <span className="text-sm font-semibold text-blue-600 truncate max-w-[200px]">{file.name}</span>
+                          <span className="text-xs text-gray-400">({(file.size / 1024).toFixed(1)} KB)</span>
+                          {/* Nút xoá — dùng button riêng, KHÔNG nằm trong vùng click file */}
+                        </div>
+                      </div>
+                    ) : (
+                      <div className="flex flex-col items-center gap-2 text-gray-400 py-2">
                         {uploadMode === 'image'
                           ? <Image className="w-10 h-10 text-gray-300" />
                           : <FileInput className="w-10 h-10 text-gray-300" />
                         }
-                        {file ? (
-                            <span className="font-semibold text-blue-600">{file.name}</span>
-                        ) : (
-                            <span>
-                              {uploadMode === 'image'
-                                ? 'Kéo thả hoặc click để chọn ảnh'
-                                : 'Kéo thả hoặc click để chọn file PDF'
-                              }
-                            </span>
-                        )}
-                    </div>
+                        <span className="text-sm">
+                          {uploadMode === 'image' ? 'Kéo thả hoặc click để chọn ảnh' : 'Kéo thả hoặc click để chọn file PDF'}
+                        </span>
+                        <span className="text-xs text-gray-300">
+                          {uploadMode === 'image' ? 'PNG, JPG, WEBP...' : 'PDF'}
+                        </span>
+                      </div>
+                    )}
+                  </div>
+
+                  {/* Nút xoá file — nằm NGOÀI drop zone, góc trên phải */}
+                  {file && !loading && (
+                    <button
+                      type="button"
+                      onMouseDown={handleDeleteFile}
+                      className="absolute -top-2 -right-2 z-10 w-6 h-6 rounded-full bg-red-500 hover:bg-red-600 text-white flex items-center justify-center text-xs font-bold shadow-md transition-colors"
+                      title="Xoá file"
+                    >
+                      ✕
+                    </button>
+                  )}
                 </div>
-                <button
-                    disabled={!file || loading}
-                    type="submit"
-                    className="w-full bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white font-semibold py-2.5 rounded-lg flex justify-center items-center gap-2 transition-all"
-                >
-                    {loading ? <Loader2 className="animate-spin w-5 h-5"/> : 'Bắt đầu xử lý'}
-                </button>
+
+                {/* Submit + Cancel buttons */}
+                <div className="flex gap-2">
+                  <button
+                      disabled={!file || loading}
+                      type="submit"
+                      className="flex-1 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white font-semibold py-2.5 rounded-lg flex justify-center items-center gap-2 transition-all"
+                  >
+                      {loading
+                        ? <><Loader2 className="animate-spin w-5 h-5"/>
+                            Đang xử lý... {elapsed > 0 && <span className="ml-1 font-mono text-blue-100">{(elapsed / 1000).toFixed(1)}s</span>}
+                          </>
+                        : 'Bắt đầu xử lý'
+                      }
+                  </button>
+                  {/* Nút Huỷ — chỉ hiện khi đang xử lý */}
+                  {loading && (
+                    <button
+                      type="button"
+                      onClick={handleCancelUpload}
+                      className="px-4 py-2.5 rounded-lg border-2 border-red-300 text-red-500 hover:bg-red-50 hover:border-red-400 font-semibold text-sm transition-all"
+                    >
+                      Huỷ
+                    </button>
+                  )}
+                </div>
               </form>
             )}
 
             {/* YouTube Form */}
             {activeTab === 'youtube' && (
-              <form onSubmit={handleYoutube} className="space-y-4">
-                <div>
-                  <label className="block text-sm font-medium text-gray-700 mb-1">YouTube URL</label>
-                  <input
-                    type="url"
-                    required
-                    placeholder="https://www.youtube.com/watch?v=..."
-                    value={youtubeUrl}
-                    onChange={(e) => setYoutubeUrl(e.target.value)}
-                    className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-all"
-                  />
-                </div>
-                <button
-                    disabled={!youtubeUrl || loading}
-                    type="submit"
-                    className="w-full bg-red-600 hover:bg-red-700 disabled:bg-red-300 text-white font-semibold py-2.5 rounded-lg flex justify-center items-center gap-2 transition-all"
-                >
-                    {loading ? <Loader2 className="animate-spin w-5 h-5"/> : 'Lấy Transcript'}
-                </button>
-              </form>
+              <div className="space-y-4">
+                {/* Step 1: Input URL + Verify */}
+                <form onSubmit={handleYoutubeVerify} className="space-y-3">
+                  <div>
+                    <label className="block text-sm font-medium text-gray-700 mb-1">YouTube URL</label>
+                    <div className="flex gap-2">
+                      <input
+                        type="url"
+                        required
+                        placeholder="https://www.youtube.com/watch?v=..."
+                        value={youtubeUrl}
+                        disabled={youtubeStep === 'select-language' || youtubeStep === 'done'}
+                        onChange={(e) => {
+                          setYoutubeUrl(e.target.value);
+                        }}
+                        className="flex-1 px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-all disabled:bg-gray-100 disabled:text-gray-500 disabled:cursor-not-allowed"
+                      />
+                      {/* Nút Huỷ — chỉ hiện sau khi verify */}
+                      {(youtubeStep === 'select-language' || youtubeStep === 'done') && (
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setYoutubeStep('input');
+                            setYoutubeUrl('');
+                            setYoutubeLanguages([]);
+                            setSelectedLanguage('');
+                            setResult('');
+                            setTiming(null);
+                            setError('');
+                          }}
+                          className="px-3 py-2 rounded-lg border-2 border-gray-300 text-gray-500 hover:border-red-400 hover:text-red-500 hover:bg-red-50 transition-all text-sm font-medium"
+                          title="Huỷ và nhập URL mới"
+                        >
+                          ✕ Huỷ
+                        </button>
+                      )}
+                    </div>
+                  </div>
+
+                  {/* Nút verify — ẩn sau khi đã verify */}
+                  {youtubeStep === 'input' && (
+                    <button
+                      disabled={!youtubeUrl || verifying || loading}
+                      type="submit"
+                      className="w-full bg-gray-700 hover:bg-gray-800 disabled:bg-gray-300 text-white font-semibold py-2.5 rounded-lg flex justify-center items-center gap-2 transition-all"
+                    >
+                      {verifying
+                        ? <><Loader2 className="animate-spin w-4 h-4" />
+                            Đang kiểm tra... {elapsed > 0 && <span className="ml-1 font-mono text-gray-300">{(elapsed / 1000).toFixed(1)}s</span>}
+                          </>
+                        : <><Youtube className="w-4 h-4" /> Kiểm tra & Lấy danh sách ngôn ngữ</>
+                      }
+                    </button>
+                  )}
+                </form>
+
+                {/* Step 2: Select language + Submit — giữ nguyên sau khi fetch */}
+                {(youtubeStep === 'select-language' || youtubeStep === 'done') && youtubeLanguages.length > 0 && (
+                  <form onSubmit={handleYoutubeTranscript} className="space-y-3 pt-3 border-t border-gray-100">
+                    <div>
+                      <label className="block text-sm font-medium text-gray-700 mb-1">
+                        Chọn ngôn ngữ transcript
+                        <span className="ml-2 text-xs text-gray-400">({youtubeLanguages.length} ngôn ngữ)</span>
+                      </label>
+                      <select
+                        value={selectedLanguage}
+                        onChange={(e) => setSelectedLanguage(e.target.value)}
+                        className="w-full px-4 py-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-red-500 focus:border-red-500 outline-none transition-all bg-white"
+                      >
+                        {youtubeLanguages.map((lang) => (
+                          <option key={lang.language_code} value={lang.language_code}>
+                            {lang.language} ({lang.language_code}){lang.is_generated ? ' — auto' : ''}
+                          </option>
+                        ))}
+                      </select>
+                    </div>
+                    <button
+                      disabled={!selectedLanguage || loading}
+                      type="submit"
+                      className="w-full bg-red-600 hover:bg-red-700 disabled:bg-red-300 text-white font-semibold py-2.5 rounded-lg flex justify-center items-center gap-2 transition-all"
+                    >
+                      {loading
+                        ? <><Loader2 className="animate-spin w-4 h-4" />
+                            Đang lấy transcript... {elapsed > 0 && <span className="ml-1 font-mono text-red-100">{(elapsed / 1000).toFixed(1)}s</span>}
+                          </>
+                        : <><FileText className="w-4 h-4" /> Lấy Transcript</>
+                      }
+                    </button>
+                  </form>
+                )}
+              </div>
             )}
 
             {error && (
@@ -384,10 +729,25 @@ function App() {
           </div>
         </div>
 
+        {/* ── Drag Divider ── */}
+        <div
+          onMouseDown={onDividerMouseDown}
+          className="group w-2 shrink-0 flex items-center justify-center cursor-col-resize select-none relative mx-1"
+          title="Kéo để thay đổi kích thước"
+        >
+          {/* Visual track */}
+          <div className="w-px h-full bg-gray-200 group-hover:bg-blue-400 transition-colors duration-150" />
+          {/* Handle knob */}
+          <div className="absolute top-1/2 -translate-y-1/2 w-4 h-8 rounded-full bg-gray-300 group-hover:bg-blue-400 group-active:bg-blue-500 flex items-center justify-center gap-px transition-colors duration-150 shadow-sm">
+            <span className="w-px h-4 bg-white/80 rounded-full" />
+            <span className="w-px h-4 bg-white/80 rounded-full" />
+          </div>
+        </div>
+
         {/* RIGHT COLUMN: Result Viewer */}
-        <div className="flex flex-col h-full bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden">
+        <div className="flex flex-col h-full bg-white rounded-xl shadow-sm border border-gray-100 overflow-hidden min-w-0 flex-1">
             <div className="p-4 border-b border-gray-200 bg-gray-50 flex justify-between items-center">
-                <div className="flex items-center gap-3">
+                <div className="flex items-center gap-3 flex-wrap">
                   <h2 className="font-semibold text-gray-700">Preview</h2>
                   {result && (
                     <span className={`text-xs px-2 py-0.5 rounded-full font-medium ${
@@ -396,6 +756,20 @@ function App() {
                         : 'bg-blue-100 text-blue-700'
                     }`}>
                       {contentType === 'html' ? 'HTML' : 'Markdown'}
+                    </span>
+                  )}
+                  {/* Realtime timer while processing */}
+                  {(loading || verifying) && elapsed > 0 && (
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-yellow-100 text-yellow-700 font-mono flex items-center gap-1">
+                      <Loader2 className="w-3 h-3 animate-spin" />
+                      {(elapsed / 1000).toFixed(1)}s
+                    </span>
+                  )}
+                  {/* Final timing badge */}
+                  {timing && !loading && !verifying && (
+                    <span className="text-xs px-2 py-0.5 rounded-full bg-green-100 text-green-700 font-medium flex items-center gap-1" title={timing.label}>
+                      ⏱ {timing.totalMs >= 1000 ? `${(timing.totalMs / 1000).toFixed(2)}s` : `${timing.totalMs}ms`}
+                      <span className="text-green-500 max-w-[140px] truncate">— {timing.label}</span>
                     </span>
                   )}
                 </div>
@@ -439,7 +813,13 @@ function App() {
                 {streamProgress && (
                   <div className="mb-4 p-3 bg-blue-50 rounded-lg border border-blue-200">
                     <div className="flex justify-between text-xs text-blue-700 mb-1.5 font-medium">
-                      <span>⚙️ Đang OCR trang {streamProgress.page} / {streamProgress.total}</span>
+                      <span className="flex items-center gap-1.5">
+                        <Loader2 className="w-3 h-3 animate-spin" />
+                        Đang OCR trang {streamProgress.page} / {streamProgress.total}
+                        {elapsed > 0 && (
+                          <span className="font-mono text-blue-500">({(elapsed / 1000).toFixed(1)}s)</span>
+                        )}
+                      </span>
                       <span>{Math.round((streamProgress.page / streamProgress.total) * 100)}%</span>
                     </div>
                     <div className="w-full bg-blue-200 rounded-full h-1.5">
@@ -479,7 +859,7 @@ function App() {
                     <article className="prose prose-sm sm:prose-base prose-blue max-w-none
                       prose-headings:font-bold prose-headings:text-gray-900
                       prose-h1:text-2xl prose-h2:text-xl prose-h3:text-lg
-                      prose-p:text-gray-700 prose-p:leading-relaxed
+                      prose-p:text-gray-700 prose-p:leading-relaxed prose-p:whitespace-pre-wrap
                       prose-a:text-blue-600 prose-a:no-underline hover:prose-a:underline
                       prose-strong:text-gray-900
                       prose-code:bg-gray-100 prose-code:px-1.5 prose-code:py-0.5 prose-code:rounded prose-code:text-sm prose-code:text-pink-600 prose-code:before:content-none prose-code:after:content-none
@@ -491,7 +871,7 @@ function App() {
                       prose-li:text-gray-700"
                     >
                         <ReactMarkdown
-                          remarkPlugins={[remarkGfm]}
+                          remarkPlugins={[remarkGfm, remarkBreaks]}
                           rehypePlugins={[
                             rehypeRaw,
                             [rehypeSanitize, {
