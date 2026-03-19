@@ -388,7 +388,7 @@ function App() {
           <header className="mb-4">
             <h1 className="text-3xl font-bold text-gray-900 flex items-center gap-2">
               <FileText className="w-8 h-8 text-blue-600" />
-              OCR Web Platform
+              Convert2Text
             </h1>
             <p className="text-gray-500 mt-2">Convert Tool - PDF, Image & YouTube</p>
           </header>
@@ -803,6 +803,13 @@ function App() {
                         className="text-sm flex items-center gap-1.5 text-gray-600 hover:text-blue-600 border border-gray-300 px-3 py-1.5 rounded-md bg-white hover:border-blue-400 transition-all"
                       >
                           <Download className="w-4 h-4" /> Download .md
+                      </button>
+                      <button
+                        onClick={() => { setResult(''); setTiming(null); setJobId(null); setError(''); }}
+                        className="text-sm flex items-center gap-1.5 text-gray-400 hover:text-red-500 border border-gray-300 hover:border-red-300 px-3 py-1.5 rounded-md bg-white transition-all"
+                        title="Xoá kết quả"
+                      >
+                        ✕ Xoá
                       </button>
                     </div>
                 )}
