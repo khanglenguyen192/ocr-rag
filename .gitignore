@@ -1,2 +1,10 @@
 .idea
 LightOnOCR-2-1B
+src/app/__pycache__
+src/app/core/__pycache__
+src/app/models/__pycache__
+src/app/ocr_engine/__pycache__
+src/app/routers/__pycache__
+src/app/schemas/__pycache__
+src/app/services/__pycache__
+src/app/utils/__pycache__

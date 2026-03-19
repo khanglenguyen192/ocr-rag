@@ -1,0 +1,53 @@
+version: "3.9"
+
+services:
+  # ── FastAPI Backend ──────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: ocr_api
+    command: uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+    ports:
+      - "8000:8000"
+    volumes:
+      - .:/app
+      - ../LightOnOCR-2-1B:/app/LightOnOCR-2-1B:ro
+      - uploads_data:/app/uploads
+    env_file:
+      - .env
+    environment:
+      - MODEL_DIR=/app/LightOnOCR-2-1B
+      - UPLOAD_DIR=/app/uploads
+      - DATABASE_URL=postgresql+asyncpg://postgres:postgres@postgres:5432/pgorc?options=-c%20search_path%3Dpgdbo
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: unless-stopped
+
+  # ── PostgreSQL ────────────────────────────────────────────────────────────────
+  postgres:
+    image: postgres:16-alpine
+    container_name: ocr_postgres
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: pgorc
+    ports:
+      - "5432:5432"
+    volumes:
+      - ./scripts/create_tables.sql:/docker-entrypoint-initdb.d/001_init.sql
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d pgorc"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # ── Not used in MVP ──────────────────────────────────────────────────────────
+  # worker, flower, redis — add back when Celery job queue is needed
+
+volumes:
+  uploads_data:
+  postgres_data:
