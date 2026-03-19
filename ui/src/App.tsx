@@ -20,17 +20,79 @@ function App() {
   const [error, setError] = useState('');
   const [jobId, setJobId] = useState<number | null>(null);
   const [viewMode, setViewMode] = useState<'preview' | 'raw'>('preview');
+  const [streamProgress, setStreamProgress] = useState<{ page: number; total: number } | null>(null);
 
   // Detect if content is HTML or Markdown
   const contentType = useMemo<'html' | 'markdown'>(() => {
     if (!result) return 'markdown';
     const trimmed = result.trimStart();
-    // Consider HTML if it starts with a tag or has common html structure
     if (/^<!DOCTYPE\s/i.test(trimmed) || /^<(html|body|div|p|h[1-6]|ul|ol|table|span|article|section|main)\b/i.test(trimmed)) {
       return 'html';
     }
     return 'markdown';
   }, [result]);
+
+  // Xử lý SSE stream (scanned PDF — trả về từng trang)
+  const processSSEStream = async (response: Response) => {
+    setResult('');
+    setStreamProgress(null);
+
+    const reader = response.body?.getReader();
+    const decoder = new TextDecoder();
+    if (!reader) return;
+
+    let buffer = '';
+    const pageTexts: string[] = [];
+
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buffer += decoder.decode(value, { stream: true });
+
+        // SSE events are separated by "\n\n"
+        const parts = buffer.split('\n\n');
+        buffer = parts.pop() ?? ''; // keep incomplete last chunk
+
+        for (const part of parts) {
+          const line = part.trim();
+          if (!line.startsWith('data: ')) continue;
+
+          try {
+            const payload = JSON.parse(line.slice(6)); // strip "data: "
+
+            if (payload.type === 'start') {
+              setStreamProgress({ page: 0, total: payload.total });
+
+            } else if (payload.type === 'page') {
+              pageTexts.push(payload.text);
+              setStreamProgress({ page: payload.page, total: payload.total });
+
+              // Build merged markdown live: pages separated by HR + comment
+              const merged = pageTexts
+                .map((t, i) => `<!-- Trang ${i + 1} -->\n\n${t.trim()}`)
+                .join('\n\n---\n\n');
+              setResult(merged);
+
+            } else if (payload.type === 'done') {
+              setStreamProgress(null);
+
+            } else if (payload.type === 'error') {
+              setError(`Lỗi OCR: ${payload.message}`);
+            }
+          } catch {
+            // ignore non-JSON lines
+          }
+        }
+      }
+    } catch (err) {
+      console.error('SSE stream reading error:', err);
+      setError('Lỗi khi đọc dữ liệu từ server.');
+    } finally {
+      setStreamProgress(null);
+    }
+  };
 
   // Xử lý Streaming response (Chuẩn bị cho tính năng load từng page)
   const processStream = async (response: Response) => {
@@ -76,6 +138,7 @@ function App() {
     setError('');
     setResult('');
     setJobId(null);
+    setStreamProgress(null);
 
     const formData = new FormData();
     // Chọn endpoint dựa theo uploadMode
@@ -98,7 +161,13 @@ function App() {
         const errorText = await response.text();
         throw new Error(`Upload failed: ${response.statusText} - ${errorText}`);
       }
-      await processStream(response);
+
+      // Scanned PDF → SSE stream (page-by-page)
+      if (uploadMode === 'pdf-scan') {
+        await processSSEStream(response);
+      } else {
+        await processStream(response);
+      }
 
     } catch (err: any) {
       setError(err.message || 'Có lỗi xảy ra khi xử lý file');
@@ -366,6 +435,21 @@ function App() {
             </div>
 
             <div className="flex-1 overflow-auto p-6 bg-white">
+                {/* Progress bar — hiển thị khi đang stream (dù đã có kết quả trang đầu) */}
+                {streamProgress && (
+                  <div className="mb-4 p-3 bg-blue-50 rounded-lg border border-blue-200">
+                    <div className="flex justify-between text-xs text-blue-700 mb-1.5 font-medium">
+                      <span>⚙️ Đang OCR trang {streamProgress.page} / {streamProgress.total}</span>
+                      <span>{Math.round((streamProgress.page / streamProgress.total) * 100)}%</span>
+                    </div>
+                    <div className="w-full bg-blue-200 rounded-full h-1.5">
+                      <div
+                        className="bg-blue-500 h-1.5 rounded-full transition-all duration-500"
+                        style={{ width: `${Math.round((streamProgress.page / streamProgress.total) * 100)}%` }}
+                      />
+                    </div>
+                  </div>
+                )}
                 {result ? (
                   viewMode === 'raw' ? (
                     /* ── RAW view: VS Code-like source editor ── */
@@ -430,8 +514,27 @@ function App() {
                         {loading ? (
                             <>
                                 <Loader2 className="w-10 h-10 animate-spin mb-4 text-blue-500" />
-                                <p>Đang xử lý dữ liệu...</p>
-                                <p className="text-xs mt-2">Dữ liệu sẽ hiện dần khi có kết quả.</p>
+                                {streamProgress ? (
+                                  <>
+                                    <p className="font-medium text-blue-600">
+                                      Đang OCR trang {streamProgress.page} / {streamProgress.total}...
+                                    </p>
+                                    <div className="mt-3 w-48 bg-gray-200 rounded-full h-2">
+                                      <div
+                                        className="bg-blue-500 h-2 rounded-full transition-all duration-300"
+                                        style={{ width: `${Math.round((streamProgress.page / streamProgress.total) * 100)}%` }}
+                                      />
+                                    </div>
+                                    <p className="text-xs mt-2 text-gray-400">
+                                      {Math.round((streamProgress.page / streamProgress.total) * 100)}%
+                                    </p>
+                                  </>
+                                ) : (
+                                  <>
+                                    <p>Đang xử lý dữ liệu...</p>
+                                    <p className="text-xs mt-2">Dữ liệu sẽ hiện dần khi có kết quả.</p>
+                                  </>
+                                )}
                             </>
                         ) : (
                             <>

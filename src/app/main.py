@@ -23,8 +23,19 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown events."""
+    import asyncio
     Path(settings.UPLOAD_DIR).mkdir(parents=True, exist_ok=True)
     logger.info("🚀 %s v%s started | device=%s", settings.APP_NAME, settings.APP_VERSION, settings.device)
+
+    # Pre-load LightOnOCR model at startup (chạy trong thread để không block event loop)
+    logger.info("⏳ Loading LightOnOCR-2-1B model at startup...")
+    try:
+        from app.ocr_engine.model_loader import load_model
+        await asyncio.to_thread(load_model)
+        logger.info("✅ LightOnOCR-2-1B model ready.")
+    except Exception:
+        logger.exception("❌ Failed to load LightOnOCR-2-1B at startup — OCR endpoints will load on first call.")
+
     yield
 
     logger.info("👋 %s shutting down.", settings.APP_NAME)
