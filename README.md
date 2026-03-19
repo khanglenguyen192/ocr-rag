@@ -91,29 +91,106 @@ MODEL_DIR = "lightonai/LightOnOCR-2-1B"   # tải online
 
 ```
 ocr-python/
-├── lightonocr_tool.ipynb       # 📓 Notebook chính — OCR với LightOnOCR-2-1B
-├── pdf-to-markdown.ipynb       # 📓 Chuyển PDF → Markdown (phương pháp khác)
-├── extract-youtube-cc.ipynb    # 📓 Trích xuất phụ đề YouTube
-├── requirement.txt             # 📦 Dependencies
+├── lightonocr_tool.ipynb       # 📓 Notebook — OCR với LightOnOCR-2-1B
+├── pdf-to-markdown.ipynb       # 📓 Notebook — PDF → Markdown
+├── extract-youtube-cc.ipynb    # 📓 Notebook — Trích xuất phụ đề YouTube
+├── requirement.txt             # 📦 Dependencies (notebooks)
 ├── README.md                   # 📖 Tài liệu này
+│
+├── docs/                       # 📋 Tài liệu nghiệp vụ
+│   └── business-requirements.md
+│
+├── skill/                      # 🧠 AI role definitions
+│   ├── senior-python-developer.md
+│   ├── senior-ai-engineer.md
+│   └── coding-standard-python.md
 │
 ├── LightOnOCR-2-1B/            # 🤖 Model local (từ HuggingFace)
 │   ├── model.safetensors
 │   ├── config.json
-│   ├── processor_config.json
 │   └── ...
 │
-├── input/                      # 📥 File đầu vào
-│   ├── *.pdf                   # PDF cần OCR
-│   ├── *.jpeg / *.png          # Ảnh cần OCR
-│   ├── layout_complexity/      # Test ảnh bố cục phức tạp
-│   ├── orientation_and_cropping/  # Test ảnh xoay/crop
-│   ├── quality/                # Test ảnh chất lượng thấp
-│   └── text_characteristics/   # Test đặc điểm chữ
+├── src/                        # 🚀 Backend FastAPI (production)
+│   ├── app/
+│   │   ├── main.py             # FastAPI app entry point
+│   │   ├── core/               # Config, DB, dependencies
+│   │   ├── models/             # SQLAlchemy ORM models
+│   │   ├── schemas/            # Pydantic v2 schemas
+│   │   ├── routers/            # API route handlers
+│   │   ├── services/           # Business logic
+│   │   ├── tasks/              # Celery async tasks
+│   │   ├── ocr_engine/         # AI inference pipeline
+│   │   └── utils/              # File helpers, YouTube utils
+│   ├── alembic/                # Database migrations
+│   ├── tests/                  # Pytest test suite
+│   ├── requirements.txt        # Backend dependencies
+│   ├── .env.example            # Environment variable template
+│   ├── docker-compose.yml      # Docker stack (API + Worker + Redis)
+│   └── Dockerfile
 │
-└── output/                     # 📤 Kết quả Markdown
-    ├── *.md                    # Markdown xuất ra
-    └── */                      # Ảnh trích xuất từ PDF
+├── input/                      # 📥 File đầu vào (notebooks)
+└── output/                     # 📤 Kết quả Markdown (notebooks)
+```
+
+---
+
+## 🚀 Backend API (src/)
+
+FastAPI backend với Celery job queue — dùng cho production.
+
+### Khởi động nhanh (local)
+
+```bash
+cd src
+
+# 1. Copy env
+cp .env.example .env
+# Chỉnh MODEL_DIR nếu cần
+
+# 2. Cài dependencies
+pip install -r requirements.txt
+
+# 3. Chạy Redis (cần Docker)
+docker run -d -p 6379:6379 redis:7-alpine
+
+# 4. Chạy API
+uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
+
+# 5. Chạy Celery worker (terminal khác)
+celery -A app.tasks.celery_app.celery_app worker --loglevel=info --concurrency=1
+```
+
+### Khởi động với Docker Compose
+
+```bash
+cd src
+docker-compose up --build
+```
+
+| Service | URL |
+|---------|-----|
+| **API + Swagger** | http://localhost:8000/docs |
+| **ReDoc** | http://localhost:8000/redoc |
+| **Celery Flower** | http://localhost:5555 |
+
+### API Endpoints
+
+| Method | Endpoint | Mô tả |
+|--------|----------|-------|
+| `GET` | `/health` | Health check |
+| `POST` | `/api/v1/pdf/digital` | Upload PDF văn bản → Markdown |
+| `POST` | `/api/v1/pdf/scanned` | Upload PDF scan → Markdown (OCR) |
+| `POST` | `/api/v1/ocr/image` | Upload ảnh → Markdown (OCR) |
+| `POST` | `/api/v1/youtube/transcript` | YouTube URL → Markdown transcript |
+| `GET` | `/api/v1/jobs/{id}` | Poll trạng thái job |
+| `GET` | `/api/v1/jobs/{id}/download` | Tải file `.md` |
+| `GET` | `/api/v1/jobs` | Danh sách jobs |
+
+### Chạy tests
+
+```bash
+cd src
+pytest tests/ -v
 ```
 
 ---
@@ -147,7 +224,7 @@ Trích xuất phụ đề (closed captions) từ video YouTube.
 
 ```python
 # Trong lightonocr_tool.ipynb
-input_path  = "input/your-document.pdf"
+input_path = "input/your-document.pdf"
 output_path = "output/your-document.md"
 
 result = process_file(input_path, output_path=output_path)
